@@ -20,6 +20,7 @@ from tqdm.auto import tqdm
 from falcon_perception import load_from_hf_export
 
 from .dataset import WordBoxDataset
+from .format import CURRENT_FORMAT
 from .modeling import Collator, forward_loss
 
 
@@ -46,6 +47,7 @@ def arguments():
     p.add_argument("--min-dimension", type=int, default=256)
     p.add_argument("--max-dimension", type=int, default=1024)
     p.add_argument("--bbox-loss-weight", type=float, default=4.0)
+    p.add_argument("--stop-loss-weight", type=float, default=8.0)
     p.add_argument("--freeze-layers", type=int, default=0)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--seed", type=int, default=17)
@@ -103,7 +105,7 @@ def save_checkpoint(accelerator, model, tokenizer, output: Path, run_id: str,
         config = {
             "architectures": ["FalconOCRForCausalLM"],
             "model_type": "falcon_ocr",
-            "wordbox_format": "wordbox-v1-normalized-1000",
+            "wordbox_format": CURRENT_FORMAT,
             "base_model": state["model_id"],
         }
         (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -117,20 +119,25 @@ def save_checkpoint(accelerator, model, tokenizer, output: Path, run_id: str,
 
 def evaluate(accelerator, model, tokenizer, validation_loader) -> dict[str, float]:
     model.eval()
-    totals = torch.zeros(6, dtype=torch.float64)
+    totals = torch.zeros(8, dtype=torch.float64)
     with torch.no_grad():
         for batch in validation_loader:
             _, sample_stats = forward_loss(
                 model, tokenizer, batch, return_sample_stats=True)
             gathered = accelerator.gather_for_metrics(sample_stats)
             totals += gathered.double().sum(dim=0).cpu()
-    if totals[1] == 0 or totals[3] == 0 or totals[5] == 0:
+    if any(totals[index] == 0 for index in (1, 3, 5, 7)):
         raise RuntimeError("Validation set contains no supervised target tokens")
-    return {
+    metrics = {
         "weighted": (totals[0] / totals[1]).item(),
         "text": (totals[2] / totals[3]).item(),
         "bbox": (totals[4] / totals[5]).item(),
+        "stop": (totals[6] / totals[7]).item(),
     }
+    # Box and stop behavior must not disappear inside thousands of easy syntax
+    # and transcription tokens when deciding which checkpoint is best.
+    metrics["selection"] = metrics["bbox"] + 0.25 * metrics["text"] + 0.25 * metrics["stop"]
+    return metrics
 
 
 def main():
@@ -147,6 +154,8 @@ def main():
         raise SystemExit("image dimensions must satisfy 0 < min <= max")
     if args.bbox_loss_weight < 1.0:
         raise SystemExit("--bbox-loss-weight must be at least 1.0")
+    if args.stop_loss_weight < 1.0:
+        raise SystemExit("--stop-loss-weight must be at least 1.0")
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation,
         mixed_precision="bf16" if args.bf16 else "no",
@@ -161,7 +170,13 @@ def main():
         hf_revision=args.model_revision,
         hf_local_dir=args.resume,
     )
-    if not model_args.perception_heads and args.model_id != "tiiuae/Falcon-OCR":
+    if model_args.perception_heads:
+        raise SystemExit(
+            "This trainer optimizes Falcon-OCR vocabulary targets only. Falcon-Perception "
+            "requires coordinate/size-head supervision and is intentionally rejected here; "
+            "see REAL_DATA_PLAN.md."
+        )
+    if args.model_id != "tiiuae/Falcon-OCR":
         accelerator.print("Warning: checkpoint auto-detected as OCR despite a different model id")
     model.train()
     if args.gradient_checkpointing:
@@ -184,13 +199,15 @@ def main():
     accelerator.print(f"dataset: train={len(train_ds)} validation={len(val_ds)}")
     collator = Collator(tokenizer, model_args, args.max_seq_len,
                         args.min_dimension, args.max_dimension,
-                        args.bbox_loss_weight)
+                        args.bbox_loss_weight, args.stop_loss_weight)
+    loader_workers = ({"persistent_workers": True, "prefetch_factor": 2}
+                      if args.num_workers else {})
     train_dl = DataLoader(train_ds, args.batch_size, shuffle=True,
                           num_workers=args.num_workers, collate_fn=collator,
-                          pin_memory=True)
+                          pin_memory=True, **loader_workers)
     val_dl = DataLoader(val_ds, args.batch_size, shuffle=False,
                         num_workers=args.num_workers, collate_fn=collator,
-                        pin_memory=True)
+                        pin_memory=True, **loader_workers)
     # Prepare dataloaders before calculating steps: their lengths change when
     # Accelerate shards them across multiple GPUs.
     train_dl, val_dl = accelerator.prepare(train_dl, val_dl)
@@ -219,19 +236,22 @@ def main():
         "epoch-0000-step-00000000", initial_state, ("best", "last"),
     )
     initial_metrics = evaluate(accelerator, model, tokenizer, val_dl)
-    best_loss = initial_metrics["weighted"]
+    best_loss = initial_metrics["selection"]
     if accelerator.is_main_process:
-        initial_state.update(val_loss=best_loss, best_val_loss=best_loss,
+        initial_state.update(val_loss=initial_metrics["weighted"], best_selection_score=best_loss,
+                             val_selection_score=initial_metrics["selection"],
                              val_text_loss=initial_metrics["text"],
                              val_bbox_loss=initial_metrics["bbox"],
+                             val_stop_loss=initial_metrics["stop"],
                              status="initial_validation_complete")
         temporary_state = initial_directory / ".trainer_state.next"
         temporary_state.write_text(json.dumps(initial_state, indent=2) + "\n")
         os.replace(temporary_state, initial_directory / "trainer_state.json")
     accelerator.wait_for_everyone()
     accelerator.print(
-        f"initial validation weighted={best_loss:.5f} "
-        f"text={initial_metrics['text']:.5f} bbox={initial_metrics['bbox']:.5f}; "
+        f"initial validation weighted={initial_metrics['weighted']:.5f} "
+        f"text={initial_metrics['text']:.5f} bbox={initial_metrics['bbox']:.5f} "
+        f"stop={initial_metrics['stop']:.5f} selection={best_loss:.5f}; "
         "best checkpoint saved")
     progress = tqdm(total=total_steps, disable=not accelerator.is_local_main_process)
     try:
@@ -267,14 +287,17 @@ def main():
             val_loss = val_metrics["weighted"]
             accelerator.print(
                 f"epoch={epoch + 1} step={global_step} weighted={val_loss:.5f} "
-                f"text={val_metrics['text']:.5f} bbox={val_metrics['bbox']:.5f}")
-            improved = val_loss < best_loss
+                f"text={val_metrics['text']:.5f} bbox={val_metrics['bbox']:.5f} "
+                f"stop={val_metrics['stop']:.5f} selection={val_metrics['selection']:.5f}")
+            improved = val_metrics["selection"] < best_loss
             if improved:
-                best_loss = val_loss
+                best_loss = val_metrics["selection"]
             state = {
                 "epoch": epoch + 1, "global_step": global_step, "val_loss": val_loss,
                 "val_text_loss": val_metrics["text"], "val_bbox_loss": val_metrics["bbox"],
-                "best_val_loss": best_loss, "model_id": args.model_id,
+                "val_stop_loss": val_metrics["stop"],
+                "val_selection_score": val_metrics["selection"],
+                "best_selection_score": best_loss, "model_id": args.model_id,
                 "model_revision": args.model_revision, "run_id": run_id,
                 "status": "epoch_complete",
             }
@@ -289,7 +312,7 @@ def main():
     except KeyboardInterrupt:
         state = {
             "epoch": epoch + 1, "global_step": global_step, "val_loss": None,
-            "best_val_loss": best_loss, "model_id": args.model_id,
+            "best_selection_score": best_loss, "model_id": args.model_id,
             "model_revision": args.model_revision, "run_id": run_id,
             "status": "interrupted",
         }

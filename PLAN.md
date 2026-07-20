@@ -33,9 +33,9 @@ supervised fine-tuning, not claimed reproduction.
 
 - Input: one document image, an explicit word-box instruction, and Falcon-OCR's
   pretrained `<|OCR_PLAIN|>` task token.
-- Output: repeated `<word>…</word><box>x0,y0,x1,y1</box>` records.
-- Coordinates: original-pixel boxes quantized to `[0,1000]` before training and
-  dequantized after generation.
+- Output: repeated `<word>…</word><box>center_x,center_y,width,height</box>` records.
+- Coordinates: fixed-width normalized values in `[0000,1000]`, converted from
+  original-pixel boxes before training and dequantized to `xyxy` after generation.
 - Loss: next-token cross entropy only on the target response. Image tokens and
   prompt tokens have label `-100`.
 - This is genuinely one-model inference: box localization is learned as token

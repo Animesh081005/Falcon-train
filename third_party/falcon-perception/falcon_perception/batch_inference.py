@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import torch
 from torch import Tensor
 
@@ -11,6 +13,22 @@ from falcon_perception.data import ImageProcessor, load_images, tokenize_inputs,
 from falcon_perception.kv_cache import KVCacheBase
 from falcon_perception.model import FalconPerception, ImgScatterEntry
 from falcon_perception.sampling import sample_token
+
+
+_WORD_RECORD = re.compile(r"<word>(.*?)</word>", re.DOTALL)
+
+
+def _has_repeated_record_tail(text: str) -> bool:
+    """Detect a degenerate repeated suffix without blocking legitimate duplicates."""
+    words = [word.strip().casefold() for word in _WORD_RECORD.findall(text)]
+    if len(words) >= 4 and len(set(words[-4:])) == 1:
+        return True
+    # Catch repetition of a multi-word phrase, requiring three complete cycles.
+    for cycle_len in range(2, min(64, len(words) // 3) + 1):
+        tail = words[-cycle_len:]
+        if words[-2 * cycle_len:-cycle_len] == tail and words[-3 * cycle_len:-2 * cycle_len] == tail:
+            return True
+    return False
 
 
 def process_batch_and_generate(
@@ -182,12 +200,16 @@ class BatchInferenceEngine:
         seed: int | None = None,
         coord_dedup_threshold: float = 0.01,
         task: str = "segmentation",
+        record_end_token_ids: list[int] | None = None,
+        max_records: int | None = None,
+        stop_on_repeated_record_cycle: bool = False,
     ):
         device = tokens.device
         rng = torch.Generator(device).manual_seed(seed) if seed is not None else None
         B, L = tokens.size()  # batch x prompts' length
+        generation_end = L + max_new_tokens
         # Round up max seqlen to multiple of block_size for better performance
-        S = (L + max_new_tokens + block_size - 1) // block_size * block_size
+        S = (generation_end + block_size - 1) // block_size * block_size
         assert S <= self.model_args.max_seq_len, (
             f"max generation length: {S} > Model's MAX_SEQ_LEN: {self.model_args.max_seq_len}"
         )
@@ -253,15 +275,36 @@ class BatchInferenceEngine:
         stop_token_ids = stop_token_ids or [self.tokenizer.eos_token_id]
         stop_ids = torch.tensor(stop_token_ids).to(device)
         should_stop_B = torch.full((B,), False, dtype=torch.bool, device=tokens.device)
+        record_counts = torch.zeros(B, dtype=torch.long, device=tokens.device)
+        record_end_ids = (torch.tensor(record_end_token_ids, device=device)
+                          if record_end_token_ids else None)
 
         seg_token_id = self.tokenizer.seg_token_id
 
-        while not torch.all(should_stop_B) and (pos := kv_cache.get_pos()) < S:
+        while not torch.all(should_stop_B) and (pos := kv_cache.get_pos()) < generation_end:
             tokens_B1, _, _ = sample_token(logits_BSV[:, -1], rng, temperature, top_k)
             if torch.any(should_stop_B):
                 tokens_B1 = tokens_B1.clone()
                 tokens_B1[should_stop_B, :] = self.tokenizer.pad_token_id
             padded_tokens_BS[:, pos] = tokens_B1[:, -1]
+
+            hit_stop_B = torch.isin(tokens_B1, stop_ids).any(dim=-1)
+            if record_end_ids is not None and pos + 1 >= len(record_end_ids):
+                suffix = padded_tokens_BS[:, pos + 1 - len(record_end_ids):pos + 1]
+                hit_record_end = torch.all(suffix == record_end_ids.unsqueeze(0), dim=-1)
+                hit_record_end.logical_and_(~should_stop_B)
+                record_counts += hit_record_end.long()
+                if max_records is not None:
+                    hit_stop_B.logical_or_(record_counts >= max_records)
+                if stop_on_repeated_record_cycle and torch.any(hit_record_end):
+                    # Decode only at record boundaries; this guard is for malformed
+                    # generation, not the normal high-throughput token path.
+                    for b in torch.where(hit_record_end)[0].tolist():
+                        generated_text = self.tokenizer.decode(
+                            padded_tokens_BS[b, L:pos + 1].detach().cpu().tolist())
+                        if _has_repeated_record_tail(generated_text):
+                            hit_stop_B[b] = True
+            next_should_stop_B = should_stop_B.logical_or(hit_stop_B)
 
             h_last = h_BSD[:, -1, :]  # (B, D)
             xy_B2, hw_B2, is_coord_B, is_size_B, coord_logits = self.model.sample_bbox(h_last, tokens_B1.squeeze(-1))
@@ -292,6 +335,10 @@ class BatchInferenceEngine:
                     for i, b in enumerate(sample_w_segm.tolist()):
                         aux_outputs[b].append_segm(segm_embeds[i])
 
+            if torch.all(next_should_stop_B):
+                should_stop_B = next_should_stop_B
+                break
+
             logits_BSV, h_BSD = self.model(
                 tokens=tokens_B1,
                 attention_mask=attention_mask,
@@ -301,8 +348,7 @@ class BatchInferenceEngine:
                 flex_attn_kernel_options=self.kernel_options or None,
             )
 
-            hit_stop_B = torch.isin(tokens_B1, stop_ids).any(dim=-1)
-            should_stop_B = should_stop_B.logical_or(hit_stop_B)
+            should_stop_B = next_should_stop_B
 
         # Batch-finalize segmentation masks per image.
         # hr_image_features are at the padded canvas size (max_dim x max_dim).

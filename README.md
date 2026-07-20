@@ -12,13 +12,15 @@ detection, not dense ordered word transcription. This project instead teaches
 Falcon-OCR a constrained autoregressive target:
 
 ```text
-<word>hello</word><box>31,92,174,131</box>
-<word>world</word><box>190,92,331,131</box>
+<word>hello</word><box>0102,0112,0143,0039</box>
+<word>world</word><box>0261,0112,0141,0039</box>
 ```
 
-Coordinates are integers in `[0, 1000]`, normalized relative to the original
-image. At inference they are converted back to pixel coordinates. The model,
-not a second detector, generates both fields.
+The four fixed-width fields are normalized `center_x,center_y,width,height` in
+`[0000, 1000]`. At inference they are converted to pixel `xyxy` boxes. This
+representation supervises extent directly and is more stable than the original
+variable-width `xyxy` strings. The model, not a second detector, generates both
+fields.
 
 The official repository is described as inference-only, but training is
 possible: the Apache-2.0 checkpoints contain ordinary safetensors, the model is
@@ -100,14 +102,14 @@ batch size 16 through gradient accumulation, learning rate `2e-5`, weight decay
 pixel image cap. Override hardware-sensitive values through environment
 variables, for example `NUM_WORKERS=16 GRAD_ACCUM=32 ./run.sh --train`.
 
-Bounding-box target tokens receive a default 4x loss weight so easy OCR text
+Bounding-box coordinate tokens receive a default 4x loss weight so easy OCR text
 cannot hide poor localization in the aggregate loss. For sparse 9–10-word pages,
 `MAX_DIMENSION=640` is a useful speed/accuracy starting point. If VRAM permits,
 `GRADIENT_CHECKPOINTING=0` avoids recomputation and is materially faster.
 
 Before optimization, training evaluates and saves the initialized model. Every
-completed epoch may atomically advance the `best` pointer based on token-weighted
-validation loss, while `last` is updated every epoch and every 1,000 optimizer
+completed epoch may atomically advance the `best` pointer based on a localization-
+and-stop-aware validation score, while `last` is updated every epoch and every 1,000 optimizer
 steps. Checkpoints are written to immutable directories before either symlink is
 changed, so interruption cannot partially overwrite the previous best model.
 
@@ -147,8 +149,14 @@ Inference:
 ```bash
 python -m wordbox_ocr.infer \
   --checkpoint runs/falcon-wordbox/best \
-  --image test.png --output prediction.json
+  --image test.png --max-words 64 --output prediction.json
 ```
+
+Inference stops on Falcon's end-of-query token, EOS, repeated record cycles, or
+the record cap. Existing v1 checkpoints are auto-detected from `config.json` and
+remain testable. See [REAL_DATA_PLAN.md](REAL_DATA_PLAN.md) for converters,
+mixture commands, real-domain curriculum, metrics, and the Falcon-Perception
+migration decision.
 
 ## Recommended training stages
 

@@ -10,7 +10,7 @@ from falcon_perception.attention import create_batch_attention_mask
 from falcon_perception.data import ImageProcessor, get_pos_thw, tokenize_inputs
 from falcon_perception.model import ImgScatterEntry
 
-from .format import PROMPT
+from .format import CURRENT_FORMAT, PROMPT, prompt_for_format
 
 
 class TrainingKVCache:
@@ -30,6 +30,7 @@ class Collator:
     min_dimension: int = 256
     max_dimension: int = 1024
     bbox_loss_weight: float = 4.0
+    stop_loss_weight: float = 8.0
 
     def __post_init__(self):
         self.processor = ImageProcessor(
@@ -39,7 +40,7 @@ class Collator:
         )
 
     def __call__(self, samples):
-        sequences, prompt_lengths, sequence_weights, images = [], [], [], []
+        sequences, prompt_lengths, sequence_weights, sequence_roles, images = [], [], [], [], []
         for sample in samples:
             processed = self.processor.preprocess(images=[sample["image"]])
             prompt_ids, selected = tokenize_inputs(
@@ -47,13 +48,22 @@ class Collator:
                 self.model_args.spatial_patch_size, 1, self.max_seq_len,
             )
             target_ids, target_offsets = self.tokenizer.encode_with_offsets(sample["target"])
-            bbox_spans = [match.span() for match in re.finditer(r"<box>.*?</box>", sample["target"])]
-            target_weights = []
+            # Weight only the coordinate payload. Counting the easy <box> tags
+            # as localization tokens makes the reported box loss misleadingly low.
+            bbox_spans = [match.span(1) for match in
+                          re.finditer(r"<box>(.*?)</box>", sample["target"], re.DOTALL)]
+            target_weights, target_roles = [], []
             for start, end in target_offsets:
                 is_bbox = start != end and any(start < box_end and end > box_start
                                                for box_start, box_end in bbox_spans)
                 target_weights.append(self.bbox_loss_weight if is_bbox else 1.0)
-            ids = list(prompt_ids) + target_ids + [self.tokenizer.eos_token_id]
+                target_roles.append(2 if is_bbox else 1)
+            # Falcon's native OCR inference treats end_of_query as a terminal
+            # token. Supervising that exact token avoids a train/infer mismatch.
+            stop_id = getattr(self.tokenizer, "end_of_query_token_id", None)
+            if stop_id is None:
+                stop_id = self.tokenizer.eos_token_id
+            ids = list(prompt_ids) + target_ids + [stop_id]
             if len(ids) > self.max_seq_len:
                 raise ValueError(
                     f"Sample {sample['path']} has {len(ids)} tokens; max is {self.max_seq_len}. "
@@ -62,19 +72,25 @@ class Collator:
             sequences.append(np.asarray(ids, dtype=np.int64))
             prompt_lengths.append(len(prompt_ids))
             sequence_weights.append(
-                np.asarray([0.0] * len(prompt_ids) + target_weights + [1.0], dtype=np.float32))
+                np.asarray([0.0] * len(prompt_ids) + target_weights +
+                           [self.stop_loss_weight], dtype=np.float32))
+            # 0=prompt/ignored, 1=text/markup, 2=box, 3=terminal token.
+            sequence_roles.append(
+                np.asarray([0] * len(prompt_ids) + target_roles + [3], dtype=np.int8))
             images.extend(selected)
 
         length = max(map(len, sequences))
         tokens = np.full((len(samples), length), self.tokenizer.pad_token_id, np.int64)
         labels = np.full((len(samples), length), -100, np.int64)
         loss_weights = np.zeros((len(samples), length), np.float32)
-        for i, (ids, prompt_len, weights) in enumerate(
-                zip(sequences, prompt_lengths, sequence_weights)):
+        token_roles = np.zeros((len(samples), length), np.int8)
+        for i, (ids, prompt_len, weights, roles) in enumerate(
+                zip(sequences, prompt_lengths, sequence_weights, sequence_roles)):
             tokens[i, -len(ids):] = ids
             start = length - len(ids) + prompt_len
             labels[i, start:] = ids[prompt_len:]
             loss_weights[i, -len(ids):] = weights
+            token_roles[i, -len(ids):] = roles
 
         if len(images) != len(samples):
             raise ValueError("Each training sample must contain exactly one usable image")
@@ -90,6 +106,7 @@ class Collator:
         )
         return {"tokens": torch.from_numpy(tokens), "labels": torch.from_numpy(labels),
                 "loss_weights": torch.from_numpy(loss_weights),
+                "token_roles": torch.from_numpy(token_roles),
                 "pixel_values": torch.from_numpy(processed["pixel_values"]),
                 "pixel_mask": torch.from_numpy(processed["padding_mask"]),
                 "pos_t": torch.from_numpy(pos_t), "pos_hw": torch.from_numpy(pos_hw)}
@@ -138,8 +155,10 @@ def forward_loss(model, tokenizer, batch, *, return_sample_stats: bool = False):
     sample_weighted_sums = token_losses.new_zeros(B).scatter_add_(
         0, sample_ids, (token_losses.detach() * packed_weights))
     sample_weighted_counts = token_losses.new_zeros(B).scatter_add_(0, sample_ids, packed_weights)
-    bbox_tokens = packed_weights > 1.0
-    text_tokens = ~bbox_tokens
+    packed_roles = batch["token_roles"][:, 1:][valid_targets]
+    text_tokens = packed_roles == 1
+    bbox_tokens = packed_roles == 2
+    stop_tokens = packed_roles == 3
     sample_text_sums = token_losses.new_zeros(B).scatter_add_(
         0, sample_ids[text_tokens], token_losses.detach()[text_tokens])
     sample_text_counts = torch.bincount(
@@ -148,15 +167,20 @@ def forward_loss(model, tokenizer, batch, *, return_sample_stats: bool = False):
         0, sample_ids[bbox_tokens], token_losses.detach()[bbox_tokens])
     sample_bbox_counts = torch.bincount(
         sample_ids[bbox_tokens], minlength=B).to(token_losses.dtype)
+    sample_stop_sums = token_losses.new_zeros(B).scatter_add_(
+        0, sample_ids[stop_tokens], token_losses.detach()[stop_tokens])
+    sample_stop_counts = torch.bincount(
+        sample_ids[stop_tokens], minlength=B).to(token_losses.dtype)
     return loss, torch.stack((
         sample_weighted_sums, sample_weighted_counts,
         sample_text_sums, sample_text_counts,
         sample_bbox_sums, sample_bbox_counts,
+        sample_stop_sums, sample_stop_counts,
     ), dim=1)
 
 
 def prepare_inference_batch(tokenizer, model_args, image, *, min_dimension=256,
-                            max_dimension=1024):
+                            max_dimension=1024, format_version=CURRENT_FORMAT):
     """Prepare one image/prompt without assuming a square maximum-size canvas."""
     processor = ImageProcessor(
         model_args.spatial_patch_size, 1,
@@ -164,7 +188,7 @@ def prepare_inference_batch(tokenizer, model_args, image, *, min_dimension=256,
     )
     images = processor.preprocess(images=[image])
     token_ids, selected = tokenize_inputs(
-        PROMPT, images, tokenizer, model_args.spatial_patch_size, 1,
+        prompt_for_format(format_version), images, tokenizer, model_args.spatial_patch_size, 1,
         model_args.max_seq_len,
     )
     if len(selected) != 1:

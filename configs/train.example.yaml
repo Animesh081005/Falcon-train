@@ -12,6 +12,7 @@ max_seq_len: 8192
 min_dimension: 256
 max_dimension: 1024
 bbox_loss_weight: 4.0
+stop_loss_weight: 8.0
 bf16: true
 gradient_checkpointing: true
 save_every_steps: 1000

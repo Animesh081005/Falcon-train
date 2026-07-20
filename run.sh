@@ -21,6 +21,7 @@ Environment overrides:
   NUM_WORKERS       DataLoader processes (default: 8)
   SAVE_EVERY_STEPS  Periodic last-checkpoint interval (default: 1000)
   BBOX_LOSS_WEIGHT  Bounding-box token loss multiplier (default: 4.0)
+  STOP_LOSS_WEIGHT  Terminal-token loss multiplier (default: 8.0)
   GRADIENT_CHECKPOINTING  1 saves VRAM; 0 is faster (default: 1)
   MIXED_PRECISION   bf16 or no (default: bf16)
   ACCELERATE_ARGS   Extra arguments before `-m wordbox_ocr.train`
@@ -59,6 +60,7 @@ MAX_DIMENSION="${MAX_DIMENSION:-1024}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 SAVE_EVERY_STEPS="${SAVE_EVERY_STEPS:-1000}"
 BBOX_LOSS_WEIGHT="${BBOX_LOSS_WEIGHT:-4.0}"
+STOP_LOSS_WEIGHT="${STOP_LOSS_WEIGHT:-8.0}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-1}"
 MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
 TRAIN_MANIFEST="${DATASET_DIR}/manifests/train.jsonl"
@@ -170,6 +172,7 @@ accelerate launch "${EXTRA_ACCELERATE_ARGS[@]}" -m wordbox_ocr.train \
   --num-workers "$NUM_WORKERS" \
   --save-every-steps "$SAVE_EVERY_STEPS" \
   --bbox-loss-weight "$BBOX_LOSS_WEIGHT" \
+  --stop-loss-weight "$STOP_LOSS_WEIGHT" \
   "${CHECKPOINTING_ARGS[@]}" \
   "${PRECISION_ARGS[@]}" \
   "${SAMPLE_ARGS[@]}"
