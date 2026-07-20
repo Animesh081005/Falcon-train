@@ -91,6 +91,7 @@ def forward_loss(model, tokenizer, batch, *, return_sample_stats: bool = False):
         eos_token_id=tokenizer.eos_token_id,
         soi_token_id=tokenizer.image_cls_token_id,
         eoi_token_id=tokenizer.end_of_image_token_id, max_len=S,
+        for_training=True,
     )
     scatter = []
     ps = core.args.spatial_patch_size

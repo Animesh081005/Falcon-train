@@ -110,6 +110,7 @@ def create_batch_attention_mask(
     soi_token_id: int,
     eoi_token_id: int,
     max_len: int | None = None,
+    for_training: bool = False,
 ) -> BlockMask:
     """Build the combined FlexAttention mask for the batch engine.
 
@@ -128,4 +129,12 @@ def create_batch_attention_mask(
     )
     mask_mod = or_masks(image_prefix_mask_mod, block_causal_mask_mod)
     max_len = max_len or S
+    # The inference wrapper deliberately creates inference tensors. Those
+    # tensors cannot be captured by FlexAttention's autograd graph. Training
+    # must call the compiled creator under ordinary grad mode instead.
+    if for_training:
+        # Explicitly disable an inherited inference context as well; a BlockMask
+        # created there cannot later be saved by FlexAttention backward.
+        with torch.inference_mode(False):
+            return _compiled_create_block_mask(mask_mod, B, None, max_len, max_len)
     return create_attention_mask(mask_mod, B, None, max_len, max_len)

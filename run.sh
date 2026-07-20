@@ -10,7 +10,8 @@ Usage:
 
 Environment overrides:
   DATASET_DIR       Dataset root (default: synthetic_ocr_data_for_falcon)
-  MODEL_ID          HF model id/path (default: tiiuae/Falcon-OCR)
+  MODEL_ID          Hugging Face model id (default: tiiuae/Falcon-OCR)
+  MODEL_DIR         Optional local Falcon-OCR checkpoint directory
   OUTPUT_ROOT       Checkpoint parent directory (default: runs)
   BATCH_SIZE        Per-GPU batch size (default: 1)
   GRAD_ACCUM        Production gradient accumulation (default: 16)
@@ -46,6 +47,7 @@ cd "$REPO_DIR"
 
 DATASET_DIR="${DATASET_DIR:-synthetic_ocr_data_for_falcon}"
 MODEL_ID="${MODEL_ID:-tiiuae/Falcon-OCR}"
+MODEL_DIR="${MODEL_DIR:-}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-runs}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 GRAD_ACCUM="${GRAD_ACCUM:-16}"
@@ -127,8 +129,18 @@ fi
 # shellcheck disable=SC2206
 EXTRA_ACCELERATE_ARGS=( ${ACCELERATE_ARGS:-} )
 
+if [[ -n "$MODEL_DIR" ]]; then
+  [[ -s "$MODEL_DIR/model.safetensors" ]] || {
+    echo "MODEL_DIR does not contain model.safetensors: $MODEL_DIR" >&2
+    exit 1
+  }
+  MODEL_ARGS=(--resume "$MODEL_DIR")
+else
+  MODEL_ARGS=(--model-id "$MODEL_ID")
+fi
+
 accelerate launch "${EXTRA_ACCELERATE_ARGS[@]}" -m wordbox_ocr.train \
-  --model-id "$MODEL_ID" \
+  "${MODEL_ARGS[@]}" \
   --train "$TRAIN_MANIFEST" \
   --validation "$VALIDATION_MANIFEST" \
   --output-dir "$OUTPUT_DIR" \

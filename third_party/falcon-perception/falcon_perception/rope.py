@@ -32,15 +32,16 @@ def apply_rotary_emb(
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """1D rotary embedding"""
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    assert freqs_cis.ndim == 3, (
-        "Freqs_cis must be indexed by position ids already and has shape (B,S,D)"
-    )
-    freqs_cis = E.rearrange(freqs_cis, "b s d -> b s 1 d")
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    """1D rotary embedding, evaluated in FP32/complex64 under mixed precision."""
+    with torch.autocast(device_type=xq.device.type, enabled=False):
+        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+        assert freqs_cis.ndim == 3, (
+            "Freqs_cis must be indexed by position ids already and has shape (B,S,D)"
+        )
+        freqs_cis = E.rearrange(freqs_cis.to(torch.complex64), "b s d -> b s 1 d")
+        xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+        xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -61,8 +62,9 @@ def apply_golden_freqs_cis_to_visual_pos(freqs_hFP, pos_BSP) -> torch.Tensor:
     Compute golden-gate 2D RoPE frequencies for every token in the batch.
     Text tokens have pos=0, giving θ=0 → identity rotation (1+0j).
     """
-    theta_BShF = torch.einsum("bsp,hfp->bshf", pos_BSP.float(), freqs_hFP.float())
-    freqs_cis_BShF = torch.polar(torch.ones_like(theta_BShF), theta_BShF)
+    with torch.autocast(device_type=pos_BSP.device.type, enabled=False):
+        theta_BShF = torch.einsum("bsp,hfp->bshf", pos_BSP.float(), freqs_hFP.float())
+        freqs_cis_BShF = torch.polar(torch.ones_like(theta_BShF), theta_BShF)
     return freqs_cis_BShF  # (B, S, H, F)
 
 
@@ -72,16 +74,17 @@ def apply_golden_rotary_emb(input_BShd, freqs_cis_BShF) -> torch.Tensor:
     identity entries (1+0j) in freqs_cis_BShF so they pass through unchanged.
     No nonzero / data-dependent shapes → zero CUDA syncs.
     """
-    x = input_BShd.float()
-    x_even = x[..., 0::2]  # (B, S, H, F)
-    x_odd = x[..., 1::2]   # (B, S, H, F)
+    with torch.autocast(device_type=input_BShd.device.type, enabled=False):
+        x = input_BShd.float()
+        x_even = x[..., 0::2]  # (B, S, H, F)
+        x_odd = x[..., 1::2]   # (B, S, H, F)
 
-    cos = freqs_cis_BShF.real
-    sin = freqs_cis_BShF.imag
+        cos = freqs_cis_BShF.real.float()
+        sin = freqs_cis_BShF.imag.float()
 
-    out = torch.empty_like(x)
-    out[..., 0::2] = x_even * cos - x_odd * sin
-    out[..., 1::2] = x_even * sin + x_odd * cos
+        out = torch.empty_like(x)
+        out[..., 0::2] = x_even * cos - x_odd * sin
+        out[..., 1::2] = x_even * sin + x_odd * cos
     return out.type_as(input_BShd)
 
 
