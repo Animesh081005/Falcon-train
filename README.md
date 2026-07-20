@@ -60,6 +60,10 @@ python scripts/generate_synthetic_dataset.py \
 The defaults reproduce the requested 9–10 words per image. For a more capable
 full-page model, create an additional dense subset with
 `--min-words 24 --max-words 80` and mix its manifest into training.
+Sparse pages use vertically stratified lines covering the full image; this is
+important because a top-heavy synthetic layout causes coordinate collapse even
+when transcription loss is low. `dataset_info.json` records layout version
+`spatially-balanced-v2`.
 
 If fonts are stored with the repository or on a mounted volume, pass
 `--font-dir /path/to/fonts`. Use a small run to verify the environment:
@@ -95,6 +99,11 @@ batch size 16 through gradient accumulation, learning rate `2e-5`, weight decay
 `0.1`, 3% warmup, gradient clipping at 1.0, gradient checkpointing, and a 1024
 pixel image cap. Override hardware-sensitive values through environment
 variables, for example `NUM_WORKERS=16 GRAD_ACCUM=32 ./run.sh --train`.
+
+Bounding-box target tokens receive a default 4x loss weight so easy OCR text
+cannot hide poor localization in the aggregate loss. For sparse 9–10-word pages,
+`MAX_DIMENSION=640` is a useful speed/accuracy starting point. If VRAM permits,
+`GRADIENT_CHECKPOINTING=0` avoids recomputation and is materially faster.
 
 Before optimization, training evaluates and saves the initialized model. Every
 completed epoch may atomically advance the `best` pointer based on token-weighted

@@ -11,6 +11,7 @@ warmup_ratio: 0.03
 max_seq_len: 8192
 min_dimension: 256
 max_dimension: 1024
+bbox_loss_weight: 4.0
 bf16: true
 gradient_checkpointing: true
 save_every_steps: 1000

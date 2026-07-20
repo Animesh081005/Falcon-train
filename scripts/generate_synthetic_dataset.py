@@ -118,6 +118,37 @@ def add_word(draw, annotations, text, x, y, font, fill):
     return x1
 
 
+def add_spatially_balanced_words(draw, annotations, rng, cfg, width, height,
+                                 margin, target_words, font_path, base_size, fill):
+    """Place sparse OCR words across the full page, in stable reading order."""
+    line_count = rng.randint(3, min(5, target_words))
+    counts = [target_words // line_count] * line_count
+    for index in range(target_words % line_count):
+        counts[index] += 1
+    usable_height = height - 2 * margin
+    band_height = usable_height / line_count
+    for line_index, count in enumerate(counts):
+        size = max(11, round(base_size * rng.uniform(0.85, 1.2)))
+        line_font_path = rng.choice(cfg.fonts) if rng.random() < 0.25 else font_path
+        tokens = [random_token(rng, cfg.vocabulary) for _ in range(count)]
+        gap = rng.randint(max(5, size // 3), max(9, size))
+        while True:
+            font = ImageFont.truetype(line_font_path, size)
+            widths = [text_size(draw, token, font)[0] for token in tokens]
+            total_width = sum(widths) + gap * (count - 1)
+            if total_width <= width - 2 * margin or size <= 10:
+                break
+            size -= 1
+        if total_width > width - 2 * margin:
+            raise RuntimeError("Sparse line cannot fit; shorten vocabulary entries")
+        max_start = width - margin - total_width
+        x = rng.randint(margin, max(margin, int(max_start)))
+        band_top = margin + line_index * band_height
+        y = round(band_top + rng.uniform(0.18, 0.72) * band_height)
+        for token in tokens:
+            x = add_word(draw, annotations, token, x, y, font, fill) + gap
+
+
 def render_page(index: int, cfg: Config) -> dict:
     rng = random.Random(cfg.seed + index * 1_000_003)
     width = max(512, round(cfg.width * rng.uniform(0.85, 1.15)))
@@ -134,43 +165,48 @@ def render_page(index: int, cfg: Config) -> dict:
     fill = (ink, ink, ink)
     y = margin
 
-    # Header/title, followed by body lines or key-value/table-like rows.
-    if rng.random() < 0.75:
-        title_font = ImageFont.truetype(font_path, round(base_size * rng.uniform(1.25, 1.7)))
-        title_start = len(annotations)
-        x = margin
-        for token in [random_token(rng, cfg.vocabulary) for _ in range(rng.randint(1, 4))]:
-            if len(annotations) >= target_words:
-                break
-            token_width, _ = text_size(draw, token, title_font)
-            if x + token_width >= width - margin:
-                break
-            x = add_word(draw, annotations, token, x, y, title_font, fill) + base_size // 2
-        if len(annotations) > title_start:
-            y = max(a["bbox"][3] for a in annotations[title_start:]) + rng.randint(base_size, base_size * 2)
+    if target_words <= 15:
+        add_spatially_balanced_words(
+            draw, annotations, rng, cfg, width, height, margin,
+            target_words, font_path, base_size, fill)
+    else:
+        # Dense document: header/title followed by conventional body lines.
+        if rng.random() < 0.75:
+            title_font = ImageFont.truetype(font_path, round(base_size * rng.uniform(1.25, 1.7)))
+            title_start = len(annotations)
+            x = margin
+            for token in [random_token(rng, cfg.vocabulary) for _ in range(rng.randint(1, 4))]:
+                if len(annotations) >= target_words:
+                    break
+                token_width, _ = text_size(draw, token, title_font)
+                if x + token_width >= width - margin:
+                    break
+                x = add_word(draw, annotations, token, x, y, title_font, fill) + base_size // 2
+            if len(annotations) > title_start:
+                y = max(a["bbox"][3] for a in annotations[title_start:]) + rng.randint(base_size, base_size * 2)
 
-    while len(annotations) < target_words and y < height - margin - base_size * 2:
-        line_size = max(11, round(base_size * rng.uniform(0.82, 1.15)))
-        line_font_path = rng.choice(cfg.fonts) if rng.random() < 0.16 else font_path
-        font = ImageFont.truetype(line_font_path, line_size)
-        x = margin + (rng.randint(0, width // 8) if rng.random() < 0.18 else 0)
-        gap = rng.randint(max(4, line_size // 4), max(8, line_size))
-        words_this_line = 0
-        while len(annotations) < target_words:
-            token = random_token(rng, cfg.vocabulary)
-            tw, _ = text_size(draw, token, font)
-            if x + tw >= width - margin:
+        while len(annotations) < target_words and y < height - margin - base_size * 2:
+            line_size = max(11, round(base_size * rng.uniform(0.82, 1.15)))
+            line_font_path = rng.choice(cfg.fonts) if rng.random() < 0.16 else font_path
+            font = ImageFont.truetype(line_font_path, line_size)
+            x = margin + (rng.randint(0, width // 8) if rng.random() < 0.18 else 0)
+            gap = rng.randint(max(4, line_size // 4), max(8, line_size))
+            words_this_line = 0
+            while len(annotations) < target_words:
+                token = random_token(rng, cfg.vocabulary)
+                tw, _ = text_size(draw, token, font)
+                if x + tw >= width - margin:
+                    break
+                x = add_word(draw, annotations, token, x, y, font, fill) + gap
+                words_this_line += 1
+                if words_this_line >= rng.randint(3, 12):
+                    break
+            if not words_this_line:
                 break
-            x = add_word(draw, annotations, token, x, y, font, fill) + gap
-            words_this_line += 1
-            if words_this_line >= rng.randint(3, 12):
-                break
-        if not words_this_line:
-            break
-        y = max(a["bbox"][3] for a in annotations[-words_this_line:]) + rng.randint(7, max(9, line_size))
-        if rng.random() < 0.09:
-            draw.line((margin, y, width - margin, y), fill=(150, 150, 150), width=1)
-            y += rng.randint(4, 10)
+            y = max(a["bbox"][3] for a in annotations[-words_this_line:]) + rng.randint(7, max(9, line_size))
+            if rng.random() < 0.09:
+                draw.line((margin, y, width - margin, y), fill=(150, 150, 150), width=1)
+                y += rng.randint(4, 10)
 
     # Mild degradations that preserve exact boxes in the image coordinate frame.
     if rng.random() < 0.45:
@@ -269,6 +305,7 @@ def main():
     (root / "dataset_info.json").write_text(json.dumps({
         "num_images": args.num_images, "splits": counts, "seed": args.seed,
         "num_fonts": len(fonts), "vocabulary_size": len(vocabulary),
+        "layout_version": "spatially-balanced-v2",
         "annotation_format": "x1,y1,x2,y2,x3,y3,x4,y4,script,text",
     }, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(counts, indent=2))

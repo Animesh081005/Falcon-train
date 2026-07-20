@@ -20,6 +20,8 @@ Environment overrides:
   MAX_DIMENSION     Production image dimension cap (default: 1024)
   NUM_WORKERS       DataLoader processes (default: 8)
   SAVE_EVERY_STEPS  Periodic last-checkpoint interval (default: 1000)
+  BBOX_LOSS_WEIGHT  Bounding-box token loss multiplier (default: 4.0)
+  GRADIENT_CHECKPOINTING  1 saves VRAM; 0 is faster (default: 1)
   MIXED_PRECISION   bf16 or no (default: bf16)
   ACCELERATE_ARGS   Extra arguments before `-m wordbox_ocr.train`
 
@@ -56,6 +58,8 @@ LEARNING_RATE="${LEARNING_RATE:-2e-5}"
 MAX_DIMENSION="${MAX_DIMENSION:-1024}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 SAVE_EVERY_STEPS="${SAVE_EVERY_STEPS:-1000}"
+BBOX_LOSS_WEIGHT="${BBOX_LOSS_WEIGHT:-4.0}"
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-1}"
 MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
 TRAIN_MANIFEST="${DATASET_DIR}/manifests/train.jsonl"
 VALIDATION_MANIFEST="${DATASET_DIR}/manifests/validation.jsonl"
@@ -125,6 +129,15 @@ elif [[ "$MIXED_PRECISION" != "no" ]]; then
   exit 2
 fi
 
+if [[ "$GRADIENT_CHECKPOINTING" == "1" ]]; then
+  CHECKPOINTING_ARGS=(--gradient-checkpointing)
+elif [[ "$GRADIENT_CHECKPOINTING" == "0" ]]; then
+  CHECKPOINTING_ARGS=(--no-gradient-checkpointing)
+else
+  echo "GRADIENT_CHECKPOINTING must be 1 or 0" >&2
+  exit 2
+fi
+
 # Word splitting is intentional: ACCELERATE_ARGS is an advanced shell override.
 # shellcheck disable=SC2206
 EXTRA_ACCELERATE_ARGS=( ${ACCELERATE_ARGS:-} )
@@ -156,7 +169,8 @@ accelerate launch "${EXTRA_ACCELERATE_ARGS[@]}" -m wordbox_ocr.train \
   --max-dimension "$MODE_MAX_DIM" \
   --num-workers "$NUM_WORKERS" \
   --save-every-steps "$SAVE_EVERY_STEPS" \
-  --gradient-checkpointing \
+  --bbox-loss-weight "$BBOX_LOSS_WEIGHT" \
+  "${CHECKPOINTING_ARGS[@]}" \
   "${PRECISION_ARGS[@]}" \
   "${SAMPLE_ARGS[@]}"
 

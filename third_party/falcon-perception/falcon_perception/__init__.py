@@ -144,6 +144,11 @@ class _FalconTokenizer:
     def encode(self, text: str) -> list[int]:
         return self._tok.encode(text).ids
 
+    def encode_with_offsets(self, text: str) -> tuple[list[int], list[tuple[int, int]]]:
+        """Return token ids and character offsets from the exact same encoding."""
+        encoding = self._tok.encode(text)
+        return encoding.ids, encoding.offsets
+
     def decode(self, ids, skip_special_tokens: bool = False) -> str:
         if not isinstance(ids, list):
             ids = list(ids)
