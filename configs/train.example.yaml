@@ -1,0 +1,16 @@
+model_id: tiiuae/Falcon-OCR
+train: data/train.jsonl
+validation: data/validation.jsonl
+output_dir: runs/falcon-wordbox
+batch_size: 1
+gradient_accumulation: 16
+epochs: 5
+learning_rate: 2.0e-5
+weight_decay: 0.1
+warmup_ratio: 0.03
+max_seq_len: 8192
+min_dimension: 256
+max_dimension: 1024
+bf16: true
+gradient_checkpointing: true
+save_every_steps: 1000
